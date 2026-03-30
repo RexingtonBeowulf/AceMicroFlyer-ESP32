@@ -7,7 +7,6 @@ Deps:   pip install bleak matplotlib
 """
 
 import asyncio, threading, tkinter as tk, time, json, os, csv, math
-import pygame
 from tkinter import ttk
 from pathlib import Path
 from bleak import BleakScanner, BleakClient
@@ -301,10 +300,12 @@ class DroneGUI:
         self._log("Ready. Connect to drone.", "inf")
 
         # Game controller support (evdev for Steam Controller)
-        self.gamepad_enabled = False
-        self.gamepad_device = None
-        self.deadzone = 0.10          # adjust if needed
+        self.gamepad_enabled  = False
+        self.gamepad_device   = None
+        self.deadzone         = 0.10    # adjust if sticks drift at rest
         self.last_gamepad_update = 0
+        self.gamepad_debug    = False   # axis confirmed: ABS_HAT2X = right trigger
+        self._seen_axes       = set()   # tracks which axis codes we have logged
 
     # ── Scrollable canvas ────────────────────────────────────
     def _setup_scroll(self):
@@ -417,23 +418,6 @@ class DroneGUI:
         self.motor_bars = {}
         self.motor_lbls = {}
 
-        # Gamepad controls
-        gp_frame = self._panel(parent, "// GAME CONTROLLER")
-        self.gp_status = tk.Label(gp_frame, text="Gamepad: OFF", 
-                                  font=self.MONO, fg=self.DIM, bg=self.PANEL)
-        self.gp_status.pack(fill="x", padx=10, pady=4)
-
-        btn_frame = tk.Frame(gp_frame, bg=self.PANEL)
-        btn_frame.pack(fill="x", padx=10, pady=(0,8))
-
-        tk.Button(btn_frame, text="Enable Gamepad", 
-                  font=("Courier New",9,"bold"), bg="#0d1a20", fg=self.ACCENT,
-                  command=self._toggle_gamepad).pack(side="left", fill="x", expand=True, padx=(0,6))
-
-        tk.Button(btn_frame, text="Disable Gamepad", 
-                  font=("Courier New",9,"bold"), bg="#1a0a0a", fg=self.DANGER,
-                  command=self._disable_gamepad).pack(side="left", fill="x", expand=True)
-
         for tag, row, col, color in [
                 ("FL",0,0,self.ACCENT),("FR",0,1,self.ACCENT),
                 ("BL",1,0,"#b060ff"), ("BR",1,1,"#b060ff")]:
@@ -451,6 +435,30 @@ class DroneGUI:
             lbl = tk.Label(cell, text="0%", font=self.MONO, fg=self.TEXT, bg="#0d1220")
             lbl.pack(pady=(2,5))
             self.motor_lbls[tag] = lbl
+
+        # ── Gamepad panel (below motor outputs) ──────────────
+        gp_frame = self._panel(parent, "// GAME CONTROLLER")
+        self.gp_status = tk.Label(gp_frame, text="Gamepad: OFF",
+                                  font=self.MONO, fg=self.DIM, bg=self.PANEL)
+        self.gp_status.pack(fill="x", padx=10, pady=4)
+        tk.Label(gp_frame,
+                 text="Left stick: Roll/Pitch  |  Right stick X: Yaw  |  Right trigger: Throttle",
+                 font=self.MONO_SM, fg=self.DIM, bg=self.PANEL).pack(
+            fill="x", padx=10, pady=(0,4))
+        btn_frame = tk.Frame(gp_frame, bg=self.PANEL)
+        btn_frame.pack(fill="x", padx=10, pady=(0,8))
+        tk.Button(btn_frame, text="Enable Gamepad",
+                  font=("Courier New",9,"bold"), bg="#0d1a20", fg=self.ACCENT,
+                  activebackground=self.ACCENT, activeforeground=self.BG,
+                  relief="flat", bd=1, pady=6, cursor="hand2",
+                  command=self._toggle_gamepad).pack(
+            side="left", fill="x", expand=True, padx=(0,6))
+        tk.Button(btn_frame, text="Disable Gamepad",
+                  font=("Courier New",9,"bold"), bg="#1a0a0a", fg=self.DANGER,
+                  activebackground=self.DANGER, activeforeground="white",
+                  relief="flat", bd=1, pady=6, cursor="hand2",
+                  command=self._disable_gamepad).pack(
+            side="left", fill="x", expand=True)
 
     # ── Motor test tab ───────────────────────────────────────
     def _build_test_tab(self, parent):
@@ -910,7 +918,17 @@ class DroneGUI:
                 if any(x in dev.name.lower() for x in ["steam", "xbox", "360", "controller", "wireless"]):
                     self.gamepad_device = dev
                     self.gamepad_enabled = True
-                    self._log(f"Gamepad connected via evdev: {dev.name} ({dev.path})", "ok")
+                    self._log(f"Gamepad: {dev.name} ({dev.path})", "ok")
+
+                    # Probe and log all absolute axes so we can see what the trigger reports
+                    caps = dev.capabilities(verbose=True)
+                    abs_axes = caps.get(("EV_ABS", 3), [])
+                    self._throttle_axis  = None   # will be set on first trigger event
+                    self._throttle_max   = 255
+                    self._log("Absolute axes on this device:", "inf")
+                    for name_tuple, info in abs_axes:
+                        name = name_tuple[0] if isinstance(name_tuple, tuple) else name_tuple
+                        self._log(f"  {name}: min={info.min} max={info.max} cur={info.value}", "inf")
                     return True
 
             self._log("No gamepad found. Is the Steam Controller turned on and paired?", "warn")
@@ -922,32 +940,83 @@ class DroneGUI:
             self._log(f"Gamepad init failed: {e}", "err")
             return False
 
+    # Axis codes that various controllers use for the right trigger
+    TRIGGER_AXES = {
+        "ABS_RZ":       evdev.ecodes.ABS_RZ,        # Xbox, most gamepads
+        "ABS_GAS":      evdev.ecodes.ABS_GAS,        # some Steam Controller modes
+        "ABS_HAT2X":    evdev.ecodes.ABS_HAT2X,      # Steam Controller right trigger
+        "ABS_BRAKE":    evdev.ecodes.ABS_BRAKE,      # alternate Steam mapping
+    }
+
+    def _apply_throttle(self, raw, axis_code):
+        """Normalise a raw trigger value to 0-100 throttle using absinfo max."""
+        try:
+            info = self.gamepad_device.absinfo(axis_code)
+            max_val = info.max if info and info.max > 0 else 255
+            min_val = info.min if info else 0
+        except Exception:
+            max_val = 255; min_val = 0
+        span = max_val - min_val
+        if span == 0:
+            return
+        throttle = max(0.0, min(1.0, (raw - min_val) / span))
+        self.throttle_var.set(int(throttle * 100))
+
     def _update_from_gamepad(self):
+        """Non-blocking gamepad poll — reads all queued events then returns.
+        Uses read_one() which returns None when the queue is empty,
+        so this never stalls the tkinter main loop."""
         if not self.gamepad_enabled or not self.gamepad_device:
             return
 
+        trigger_codes = set(self.TRIGGER_AXES.values())
+
         try:
-            for event in self.gamepad_device.read_loop():
-                if event.type == evdev.ecodes.EV_ABS:
-                    val = (event.value - 32768) / 32768.0   # normalize to -1.0 ... 1.0
-
-                    if event.code == evdev.ecodes.ABS_X:        # Left stick X → Roll
-                        self.roll_var.set(int(max(-30, min(30, val * 30))))
-                    elif event.code == evdev.ecodes.ABS_Y:      # Left stick Y → Pitch (inverted)
-                        self.pitch_var.set(int(max(-30, min(30, -val * 30))))
-                    elif event.code == evdev.ecodes.ABS_RX:     # Right stick X → Yaw
-                        self.yaw_var.set(int(max(-100, min(100, val * 100))))
-                    elif event.code == evdev.ecodes.ABS_RZ:     # Right trigger → Throttle
-                        throttle = max(0.0, event.value / 255.0)
-                        self.throttle_var.set(int(throttle * 100))
-
-                # Yield control back to Tkinter regularly
-                if time.time() - self.last_gamepad_update > 0.015:
-                    self.last_gamepad_update = time.time()
+            while True:
+                event = self.gamepad_device.read_one()
+                if event is None:
                     break
+                if event.type != evdev.ecodes.EV_ABS:
+                    continue
 
-        except Exception as e:
-            self._log(f"Gamepad read error: {e}", "warn")
+                code = event.code
+                raw  = event.value
+
+                # Debug: log any unrecognised axis the first time we see it
+                if self.gamepad_debug and code not in self._seen_axes:
+                    self._seen_axes.add(code)
+                    name = evdev.ecodes.ABS.get(code, f"ABS_{code}")
+                    self._log(f"[GP] New axis: {name} (code={code}) raw={raw}", "inf")
+
+                if code == evdev.ecodes.ABS_X:
+                    val = raw / 32768.0
+                    if abs(val) < self.deadzone: val = 0.0
+                    self.roll_var.set(int(max(-30, min(30, val * 30))))
+
+                elif code == evdev.ecodes.ABS_Y:
+                    val = raw / 32768.0
+                    if abs(val) < self.deadzone: val = 0.0
+                    self.pitch_var.set(int(max(-30, min(30, -val * 30))))
+
+                elif code == evdev.ecodes.ABS_RX:
+                    val = raw / 32768.0
+                    if abs(val) < self.deadzone: val = 0.0
+                    self.yaw_var.set(int(max(-100, min(100, val * 100))))
+
+                elif code in trigger_codes:
+                    # Right trigger — whichever axis code this controller uses
+                    if self.gamepad_debug:
+                        name = evdev.ecodes.ABS.get(code, f"ABS_{code}")
+                        self._log(f"[GP] Trigger axis={name} raw={raw}", "inf")
+                    self._apply_throttle(raw, code)
+
+        except BlockingIOError:
+            pass
+        except OSError:
+            self._log("Gamepad disconnected", "warn")
+            self._disable_gamepad()
+        except Exception as ex:
+            self._log(f"Gamepad read error: {ex}", "warn")
             self._disable_gamepad()
 
     def _toggle_gamepad(self):
@@ -972,6 +1041,7 @@ class DroneGUI:
     def _gamepad_tick(self):
         if self.gamepad_enabled:
             self._update_from_gamepad()
+            self._push_controls()   # push whatever the gamepad just set
         self.root.after(15, self._gamepad_tick)
 
     # ── BLE state ────────────────────────────────────────────

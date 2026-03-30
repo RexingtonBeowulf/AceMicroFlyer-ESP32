@@ -191,13 +191,14 @@ void resetPID() {
 // ═══════════════════════════════════════════════════════════
 int lastFL=0,lastFR=0,lastBL=0,lastBR=0;
 
-void applyMix(int throttle, float rCorr, float pCorr, float yCorr) {
+// applyMix: rollCorr from rollPID, pitchCorr from pitchPID, yawCorr from yawPID
+void applyMix(int throttle, float rollCorr, float pitchCorr, float yawCorr) {
   if(throttle<3){ stopAllMotors(); return; }
   int base = map(throttle,0,100,DUTY_MIN,DUTY_MAX);
-  lastFL = clamp_i((int)(base+pCorr+rCorr-yCorr), DUTY_MIN, DUTY_MAX);
-  lastFR = clamp_i((int)(base+pCorr-rCorr+yCorr), DUTY_MIN, DUTY_MAX);
-  lastBL = clamp_i((int)(base-pCorr+rCorr+yCorr), DUTY_MIN, DUTY_MAX);
-  lastBR = clamp_i((int)(base-pCorr-rCorr-yCorr), DUTY_MIN, DUTY_MAX);
+  lastFR = clamp_i((int)(base-pitchCorr+rollCorr+yawCorr), DUTY_MIN, DUTY_MAX);
+  lastFL = clamp_i((int)(base-pitchCorr-rollCorr-yawCorr), DUTY_MIN, DUTY_MAX);
+  lastBR = clamp_i((int)(base+pitchCorr+rollCorr-yawCorr), DUTY_MIN, DUTY_MAX);
+  lastBL = clamp_i((int)(base+pitchCorr-rollCorr+yawCorr), DUTY_MIN, DUTY_MAX);
   ledcWrite(0,lastFL); ledcWrite(1,lastFR);
   ledcWrite(2,lastBL); ledcWrite(3,lastBR);
 }
@@ -477,7 +478,7 @@ void loop() {
         float rC=computePID(rollState, rollGains, sp_roll,     cf_roll,  pidDt);
         float pC=computePID(pitchState,pitchGains,sp_pitch,    cf_pitch, pidDt);
         float yC=computePID(yawState,  yawGains,  sp_yaw_rate, gz_rate,  pidDt);
-        applyMix(sp_throttle, pC, rC, yC);
+        applyMix(sp_throttle, rC, pC, yC);
         logSample();  // only writes when logArmed
       }
 
