@@ -7,16 +7,20 @@ Deps:   pip install bleak matplotlib
 """
 
 import asyncio, threading, tkinter as tk, time, json, os, csv, math
+import pygame
 from tkinter import ttk
 from pathlib import Path
 from bleak import BleakScanner, BleakClient
 from bleak.exc import BleakError
+import evdev
+from evdev import ecodes as e
+
 
 SERVICE_UUID = "12345678-1234-1234-1234-123456789abc"
 CHAR_UUID    = "abcdefab-cdef-abcd-efab-cdefabcdefab"
 NOTIFY_UUID  = "abcdefab-cdef-abcd-efab-cdefabcdef00"
 DEVICE_NAME  = "ESP32-C3-Drone"
-DUTY_MAX     = 800
+DUTY_MAX     = 1023
 SETTINGS_FILE = Path.home() / ".drone_pid_settings.json"
 
 MOTOR_LABELS = ["M1 FL GPIO5 CW","M2 FR GPIO4 CCW",
@@ -296,6 +300,12 @@ class DroneGUI:
         self._tick_hz()
         self._log("Ready. Connect to drone.", "inf")
 
+        # Game controller support (evdev for Steam Controller)
+        self.gamepad_enabled = False
+        self.gamepad_device = None
+        self.deadzone = 0.10          # adjust if needed
+        self.last_gamepad_update = 0
+
     # ── Scrollable canvas ────────────────────────────────────
     def _setup_scroll(self):
         outer = tk.Frame(self.root, bg=self.BG)
@@ -406,6 +416,24 @@ class DroneGUI:
         mgrid.pack(fill="x", padx=10, pady=(0,8))
         self.motor_bars = {}
         self.motor_lbls = {}
+
+        # Gamepad controls
+        gp_frame = self._panel(parent, "// GAME CONTROLLER")
+        self.gp_status = tk.Label(gp_frame, text="Gamepad: OFF", 
+                                  font=self.MONO, fg=self.DIM, bg=self.PANEL)
+        self.gp_status.pack(fill="x", padx=10, pady=4)
+
+        btn_frame = tk.Frame(gp_frame, bg=self.PANEL)
+        btn_frame.pack(fill="x", padx=10, pady=(0,8))
+
+        tk.Button(btn_frame, text="Enable Gamepad", 
+                  font=("Courier New",9,"bold"), bg="#0d1a20", fg=self.ACCENT,
+                  command=self._toggle_gamepad).pack(side="left", fill="x", expand=True, padx=(0,6))
+
+        tk.Button(btn_frame, text="Disable Gamepad", 
+                  font=("Courier New",9,"bold"), bg="#1a0a0a", fg=self.DANGER,
+                  command=self._disable_gamepad).pack(side="left", fill="x", expand=True)
+
         for tag, row, col, color in [
                 ("FL",0,0,self.ACCENT),("FR",0,1,self.ACCENT),
                 ("BL",1,0,"#b060ff"), ("BR",1,1,"#b060ff")]:
@@ -499,7 +527,7 @@ class DroneGUI:
             self._gain_vars[axis] = {}
             frame = self._panel(parent, f"// {label}  ({axis})")
             for param, lo, hi, res in [
-                    ("kP", 0.0, 10.0, 0.01),
+                    ("kP", 0.0, 50.0, 0.01),
                     ("kI", 0.0,  1.0, 0.001),
                     ("kD", 0.0,  2.0, 0.005)]:
                 var = tk.DoubleVar(value=saved.get(param, DEFAULT_GAINS[axis][param]))
@@ -873,6 +901,78 @@ class DroneGUI:
             val_lbl.config(text=f"{var.get()}{unit}")
             self._push_controls()
         var.trace_add("write", on)
+
+    # ====================== STEAM CONTROLLER via evdev ======================
+    def _init_gamepad(self):
+        try:
+            devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
+            for dev in devices:
+                if any(x in dev.name.lower() for x in ["steam", "xbox", "360", "controller", "wireless"]):
+                    self.gamepad_device = dev
+                    self.gamepad_enabled = True
+                    self._log(f"Gamepad connected via evdev: {dev.name} ({dev.path})", "ok")
+                    return True
+
+            self._log("No gamepad found. Is the Steam Controller turned on and paired?", "warn")
+            return False
+        except ImportError:
+            self._log("evdev not installed. Run: pip install evdev", "err")
+            return False
+        except Exception as e:
+            self._log(f"Gamepad init failed: {e}", "err")
+            return False
+
+    def _update_from_gamepad(self):
+        if not self.gamepad_enabled or not self.gamepad_device:
+            return
+
+        try:
+            for event in self.gamepad_device.read_loop():
+                if event.type == evdev.ecodes.EV_ABS:
+                    val = (event.value - 32768) / 32768.0   # normalize to -1.0 ... 1.0
+
+                    if event.code == evdev.ecodes.ABS_X:        # Left stick X → Roll
+                        self.roll_var.set(int(max(-30, min(30, val * 30))))
+                    elif event.code == evdev.ecodes.ABS_Y:      # Left stick Y → Pitch (inverted)
+                        self.pitch_var.set(int(max(-30, min(30, -val * 30))))
+                    elif event.code == evdev.ecodes.ABS_RX:     # Right stick X → Yaw
+                        self.yaw_var.set(int(max(-100, min(100, val * 100))))
+                    elif event.code == evdev.ecodes.ABS_RZ:     # Right trigger → Throttle
+                        throttle = max(0.0, event.value / 255.0)
+                        self.throttle_var.set(int(throttle * 100))
+
+                # Yield control back to Tkinter regularly
+                if time.time() - self.last_gamepad_update > 0.015:
+                    self.last_gamepad_update = time.time()
+                    break
+
+        except Exception as e:
+            self._log(f"Gamepad read error: {e}", "warn")
+            self._disable_gamepad()
+
+    def _toggle_gamepad(self):
+        if not self.gamepad_enabled:
+            if self._init_gamepad():
+                self.gp_status.config(text=f"Gamepad: {self.gamepad_device.name}", fg=self.OK)
+                self.root.after(10, self._gamepad_tick)
+        else:
+            self._disable_gamepad()
+
+    def _disable_gamepad(self):
+        self.gamepad_enabled = False
+        if self.gamepad_device:
+            try:
+                self.gamepad_device.close()
+            except:
+                pass
+            self.gamepad_device = None
+        self.gp_status.config(text="Gamepad: OFF", fg=self.DIM)
+        self._log("Gamepad disabled", "inf")
+
+    def _gamepad_tick(self):
+        if self.gamepad_enabled:
+            self._update_from_gamepad()
+        self.root.after(15, self._gamepad_tick)
 
     # ── BLE state ────────────────────────────────────────────
     def _on_ble_connect(self):    self.root.after(0, self._gui_connect)

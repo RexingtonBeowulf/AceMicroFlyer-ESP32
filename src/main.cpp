@@ -90,6 +90,11 @@ bool      logPending = false;   // true = log full, waiting to stream
 unsigned long logStartMs = 0;
 int8_t    logAxis    = 0;       // 0=roll, 1=pitch
 
+// Non-blocking log streaming
+bool logStreaming = false;
+int logStreamIndex = 0;
+unsigned long lastStreamMs = 0;
+
 // Which setpoint/measured to record (set by CAPTURE command)
 volatile float* log_setpoint_ptr = &sp_roll;
 volatile float* log_measured_ptr = &cf_roll;
@@ -225,30 +230,15 @@ void logSample() {
 // Stream the log over BLE as CSV text chunks
 // Format per chunk: "D:<idx>,<dt>,<sp>,<meas>,<fl>,<fr>\n" repeated
 void streamLog() {
-  if(!bleConnected || logCount==0) return;
-  Serial.println("[LOG] Streaming...");
-  bleNotify("LOG:START");
-  delay(50);
+    if (!bleConnected || logCount == 0) return;
 
-  // Work out start index for a full ordered sequence
-  int start = (logCount < LOG_SIZE) ? 0 : logHead;
+    Serial.println("[LOG] Starting non-blocking stream of " + String(logCount) + " samples");
+    bleNotify("LOG:START");
+    delay(30);                     // small safe delay after START
 
-  char buf[64];
-  for(int i=0; i<logCount; i++) {
-    int idx = (start + i) % LOG_SIZE;
-    LogRecord& r = logBuf[idx];
-    snprintf(buf, sizeof(buf), "D:%d,%u,%d,%d,%u,%u\n",
-             i, r.dt_ms, r.setpoint, r.measured, r.motorFL, r.motorFR);
-    pCharNotify->setValue((uint8_t*)buf, strlen(buf));
-    pCharNotify->notify();
-    delay(20);  // ~50 Hz stream — fast enough, slow enough for BLE stack
-  }
-
-  bleNotify("LOG:END");
-  logPending = false;
-  logCount   = 0;
-  logHead    = 0;
-  Serial.println("[LOG] Stream complete");
+    logStreaming = true;
+    logStreamIndex = 0;
+    lastStreamMs = millis();
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -487,7 +477,7 @@ void loop() {
         float rC=computePID(rollState, rollGains, sp_roll,     cf_roll,  pidDt);
         float pC=computePID(pitchState,pitchGains,sp_pitch,    cf_pitch, pidDt);
         float yC=computePID(yawState,  yawGains,  sp_yaw_rate, gz_rate,  pidDt);
-        applyMix(sp_throttle, rC, pC, yC);
+        applyMix(sp_throttle, pC, rC, yC);
         logSample();  // only writes when logArmed
       }
 
@@ -497,6 +487,36 @@ void loop() {
         Serial.printf("R=%+5.1f° P=%+5.1f° | T=%d | kP_r=%.3f kI_r=%.4f kD_r=%.3f\n",
           cf_roll,cf_pitch,sp_throttle,
           rollGains.kP,rollGains.kI,rollGains.kD);
+      }
+
+          // ── Non-blocking log streaming (~50 notifies/sec max) ─────────────────
+      if (logStreaming && bleConnected) {
+        if (millis() - lastStreamMs >= 20) {        // ← 20 ms = ~50 Hz, safe for NimBLE
+            lastStreamMs = millis();
+
+            int start = (logCount < LOG_SIZE) ? 0 : logHead;
+            int idx = (start + logStreamIndex) % LOG_SIZE;
+            LogRecord& r = logBuf[idx];
+
+            char buf[64];
+            snprintf(buf, sizeof(buf), "D:%d,%u,%d,%d,%u,%u\n",
+                     logStreamIndex, r.dt_ms, r.setpoint, r.measured,
+                     r.motorFL, r.motorFR);
+
+            pCharNotify->setValue((uint8_t*)buf, strlen(buf));
+            pCharNotify->notify();
+
+            logStreamIndex++;
+
+            if (logStreamIndex >= logCount) {
+                bleNotify("LOG:END");
+                Serial.printf("[LOG] Stream complete: sent %d samples\n", logCount);
+                logStreaming = false;
+                logPending = false;
+                logCount = 0;
+                logHead = 0;
+            }
+        }
       }
     }
   }
