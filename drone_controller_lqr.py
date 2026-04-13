@@ -26,9 +26,11 @@ MOTOR_LABELS = ["M1 FL GPIO5 CW","M2 FR GPIO4 CCW",
                 "M3 BL GPIO2 CCW","M4 BR GPIO3 CW"]
 
 DEFAULT_GAINS = {
-    "R": {"kP": 1.2,  "kI": 0.004, "kD": 0.080},
-    "P": {"kP": 1.2,  "kI": 0.004, "kD": 0.080},
-    "Y": {"kP": 2.0,  "kI": 0.010, "kD": 0.000},
+    # LQR K matrix rows — columns are [phi, phi_dot, theta, theta_dot]
+    # These match the defaults from lqr_designer.py output
+    "R": {"k0": 8.165882, "k1": 0.572471, "k2": 0.0, "k3": 0.0},
+    "P": {"k0": 0.0,      "k1": 0.0,      "k2": 8.165882, "k3": 0.572471},
+    "Y": {"kP": 2.0},  # yaw uses simple P on rate
 }
 
 def load_settings():
@@ -521,56 +523,89 @@ class DroneGUI:
                   cursor="hand2", command=self._test_stop
                   ).pack(side="right", fill="x", expand=True)
 
-    # ── PID tuning tab ───────────────────────────────────────
+    # ── LQR tuning tab ───────────────────────────────────────
     def _build_pid_tab(self, parent):
-        info = self._panel(parent, "// Live PID tuning")
+        info = self._panel(parent, "// Live LQR tuning")
         tk.Label(info,
-            text="Changes send immediately over BLE — no reflash needed.\n"
+            text="Run lqr_designer.py on your laptop to compute K values.\n"
+                 "Enter the K row values here and Send — no reflash needed.\n"
                  "Settings auto-save to ~/.drone_pid_settings.json",
             font=self.MONO_SM, fg=self.DIM, bg=self.PANEL,
             justify="left").pack(padx=12, pady=(0,8))
 
-        for axis, label in [("R","Roll"), ("P","Pitch"), ("Y","Yaw rate")]:
+        # Roll and Pitch rows — 4 K values each
+        for axis, label, col_labels in [
+                ("R", "Roll  K row  [phi, phi_dot, theta, theta_dot]",
+                       ["k0 (phi)",  "k1 (phi_dot)", "k2 (theta)", "k3 (th_dot)"]),
+                ("P", "Pitch K row  [phi, phi_dot, theta, theta_dot]",
+                       ["k0 (phi)",  "k1 (phi_dot)", "k2 (theta)", "k3 (th_dot)"])]:
             saved = self._saved_gains.get(axis, DEFAULT_GAINS[axis])
             self._gain_vars[axis] = {}
-            frame = self._panel(parent, f"// {label}  ({axis})")
-            for param, lo, hi, res in [
-                    ("kP", 0.0,  50, 0.01),
-                    ("kI", 0.0,  2.0, 0.001),
-                    ("kD", 0.0,  1.0, 0.005)]:
-                var = tk.DoubleVar(value=saved.get(param, DEFAULT_GAINS[axis][param]))
+            frame = self._panel(parent, f"// {label}")
+            for param, col_label, lo, hi in [
+                    ("k0", col_labels[0],  0.0, 50.0),
+                    ("k1", col_labels[1],  0.0, 10.0),
+                    ("k2", col_labels[2],  0.0, 50.0),
+                    ("k3", col_labels[3],  0.0, 10.0)]:
+                var = tk.DoubleVar(value=saved.get(param, DEFAULT_GAINS[axis].get(param, 0.0)))
                 self._gain_vars[axis][param] = var
                 row = tk.Frame(frame, bg=self.PANEL)
                 row.pack(fill="x", padx=10, pady=2)
-                tk.Label(row, text=param, font=self.MONO_LG, fg=self.ACCENT,
-                         bg=self.PANEL, width=5, anchor="w").pack(side="left")
-                val_lbl = tk.Label(row, text=f"{var.get():.3f}", font=self.MONO,
-                                   fg=self.TEXT, bg=self.PANEL, width=7, anchor="e")
+                tk.Label(row, text=col_label, font=self.MONO, fg=self.ACCENT,
+                         bg=self.PANEL, width=14, anchor="w").pack(side="left")
+                val_lbl = tk.Label(row, text=f"{var.get():.4f}", font=self.MONO,
+                                   fg=self.TEXT, bg=self.PANEL, width=8, anchor="e")
                 val_lbl.pack(side="right")
                 sl = ttk.Scale(row, from_=lo, to=hi, orient="horizontal",
-                               variable=var, length=260)
+                               variable=var, length=220)
                 sl.pack(side="left", fill="x", expand=True, padx=6)
-                def on_gain(*_, ax=axis, pr=param, vr=var, vl=val_lbl):
-                    vl.config(text=f"{vr.get():.3f}")
+                def on_gain(*_, vr=var, vl=val_lbl):
+                    vl.config(text=f"{vr.get():.4f}")
                 var.trace_add("write", on_gain)
 
             bf = tk.Frame(frame, bg=self.PANEL)
             bf.pack(fill="x", padx=10, pady=(4,10))
-            tk.Button(bf, text=f"Send {label} gains",
+            tk.Button(bf, text=f"Send {axis} row to drone",
                 font=("Courier New",9,"bold"), bg="#0d1a20", fg=self.ACCENT,
                 activebackground=self.ACCENT, activeforeground=self.BG,
                 relief="flat", bd=1, pady=6, cursor="hand2",
                 command=lambda ax=axis: self._send_gains(ax)
             ).pack(side="left", fill="x", expand=True, padx=(0,6))
-            tk.Button(bf, text="Reset defaults",
+            tk.Button(bf, text="Reset",
                 font=("Courier New",9,"bold"), bg="#0d1220", fg=self.DIM,
                 relief="flat", bd=1, pady=6, cursor="hand2",
                 command=lambda ax=axis: self._reset_gains(ax)
             ).pack(side="right")
 
+        # Yaw — just kP
+        saved_y = self._saved_gains.get("Y", DEFAULT_GAINS["Y"])
+        self._gain_vars["Y"] = {}
+        yframe = self._panel(parent, "// Yaw rate  (simple P on gyro Z)")
+        yrow = tk.Frame(yframe, bg=self.PANEL)
+        yrow.pack(fill="x", padx=10, pady=4)
+        tk.Label(yrow, text="kP", font=self.MONO, fg=self.ACCENT,
+                 bg=self.PANEL, width=14, anchor="w").pack(side="left")
+        yvar = tk.DoubleVar(value=saved_y.get("kP", 2.0))
+        self._gain_vars["Y"]["kP"] = yvar
+        y_lbl = tk.Label(yrow, text=f"{yvar.get():.3f}", font=self.MONO,
+                         fg=self.TEXT, bg=self.PANEL, width=8, anchor="e")
+        y_lbl.pack(side="right")
+        ttk.Scale(yrow, from_=0.0, to=10.0, orient="horizontal",
+                  variable=yvar, length=220).pack(
+            side="left", fill="x", expand=True, padx=6)
+        yvar.trace_add("write", lambda *_: y_lbl.config(text=f"{yvar.get():.3f}"))
+        ybf = tk.Frame(yframe, bg=self.PANEL)
+        ybf.pack(fill="x", padx=10, pady=(0,10))
+        tk.Button(ybf, text="Send Yaw kP",
+            font=("Courier New",9,"bold"), bg="#0d1a20", fg=self.ACCENT,
+            activebackground=self.ACCENT, activeforeground=self.BG,
+            relief="flat", bd=1, pady=6, cursor="hand2",
+            command=lambda: self._send_gains("Y")
+        ).pack(fill="x")
+
         save_row = tk.Frame(parent, bg=self.BG)
         save_row.pack(fill="x", padx=12, pady=(4,8))
-        tk.Button(save_row, text="Save all gains to disk",
+        tk.Button(save_row, text="Save all to disk",
             font=("Courier New",10,"bold"), bg=self.OK, fg=self.BG,
             activebackground="#00b060", bd=0, pady=10, cursor="hand2",
             command=self._save_all_gains
@@ -648,20 +683,29 @@ class DroneGUI:
     # ── PID actions ──────────────────────────────────────────
     def _send_gains(self, axis):
         v = self._gain_vars[axis]
-        kp = v["kP"].get(); ki = v["kI"].get(); kd = v["kD"].get()
-        pkt = f"PID:{axis},{kp:.4f},{ki:.5f},{kd:.4f}"
-        self.ble.send_raw(pkt)
-        self._log(f"Sent {axis}: kP={kp:.4f} kI={ki:.5f} kD={kd:.4f}", "inf")
+        if axis == "Y":
+            kp = v["kP"].get()
+            pkt = f"PID:Y,{kp:.4f},0,0"
+            self.ble.send_raw(pkt)
+            self._log(f"Sent Yaw kP={kp:.4f}", "inf")
+        else:
+            k0 = v["k0"].get(); k1 = v["k1"].get()
+            k2 = v["k2"].get(); k3 = v["k3"].get()
+            pkt = f"LQR:{axis},{k0:.6f},{k1:.6f},{k2:.6f},{k3:.6f}"
+            self.ble.send_raw(pkt)
+            self._log(f"Sent LQR {axis}: [{k0:.4f}, {k1:.4f}, {k2:.4f}, {k3:.4f}]", "inf")
 
     def _reset_gains(self, axis):
         defs = DEFAULT_GAINS[axis]
         for param, val in defs.items():
-            self._gain_vars[axis][param].set(val)
+            if param in self._gain_vars.get(axis, {}):
+                self._gain_vars[axis][param].set(val)
 
     def _save_all_gains(self):
         gains = {}
         for axis in ("R","P","Y"):
-            gains[axis] = {p: self._gain_vars[axis][p].get() for p in ("kP","kI","kD")}
+            gains[axis] = {p: self._gain_vars[axis][p].get()
+                           for p in self._gain_vars[axis]}
         save_settings(gains)
         self._log(f"Gains saved to {SETTINGS_FILE}", "ok")
 
@@ -809,16 +853,17 @@ class DroneGUI:
             return
 
         # PID ack — sync sliders with what drone confirmed
-        if msg.startswith("PID:ACK:"):
+        if msg.startswith("LQR:ACK:") or msg.startswith("PID:ACK:"):
             try:
-                rest = msg[8:]           # e.g. "R,1.200,0.0040,0.0800"
+                rest = msg[8:]           # e.g. "R,8.1659,0.5725,0.0,0.0"
                 axis = rest[0]
-                kp,ki,kd = [float(x) for x in rest[2:].split(",")]
+                vals = [float(x) for x in rest[2:].split(",")]
                 if axis in self._gain_vars:
-                    self._gain_vars[axis]["kP"].set(kp)
-                    self._gain_vars[axis]["kI"].set(ki)
-                    self._gain_vars[axis]["kD"].set(kd)
-                self._log(f"Drone confirmed {axis}: kP={kp:.3f} kI={ki:.4f} kD={kd:.3f}", "ok")
+                    params = list(self._gain_vars[axis].keys())
+                    for i, p in enumerate(params):
+                        if i < len(vals):
+                            self._gain_vars[axis][p].set(vals[i])
+                self._log(f"Drone confirmed {axis}: {vals}", "ok")
             except Exception:
                 pass
             return
