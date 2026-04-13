@@ -1,6 +1,6 @@
 /*
   ╔══════════════════════════════════════════════════════════════╗
-  ║   ESP32-C3 Drone — BLE + PID + Live Tuning + Data Logging   ║
+  ║   ESP32-C3 Drone — PID (fixed D-on-measurement + LPF)       ║
   ║                                                              ║
   ║  BLE write commands:                                         ║
   ║    Flight:   "T:<0-100>,P:<deg>,R:<deg>,Y:<-100-100>"        ║
@@ -52,7 +52,8 @@ PIDGains pitchGains = {1.2f, 0.004f, 0.08f};
 PIDGains yawGains   = {2.0f, 0.010f, 0.00f};
 
 const float I_CLAMP = 80.0f;
-struct PIDState { float integral=0, prevError=0; };
+const float D_LPF_ALPHA = 0.8f;  // D-term LPF (0=no filter, 1=heavy)
+struct PIDState { float integral=0, prevError=0, prevMeasured=0, filteredDeriv=0; };
 PIDState rollState, pitchState, yawState;
 
 // ── Setpoints ───────────────────────────────────────────────
@@ -137,7 +138,7 @@ RawIMU readRawIMU() {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B);
   Wire.endTransmission(false);
-  Wire.requestFrom(MPU_ADDR,14,true);
+  Wire.requestFrom(MPU_ADDR,(uint8_t)14,true);
   RawIMU r;
   r.ax=Wire.read()<<8|Wire.read();
   r.ay=Wire.read()<<8|Wire.read();
@@ -177,9 +178,15 @@ float computePID(PIDState& s, const PIDGains& g,
                  float setpoint, float measured, float dt) {
   float err = setpoint - measured;
   s.integral = clamp_f(s.integral + err*dt, -I_CLAMP, I_CLAMP);
-  float deriv = (err - s.prevError) / dt;
-  s.prevError = err;
-  return g.kP*err + g.kI*s.integral + g.kD*deriv;
+
+  // Derivative on MEASUREMENT (not error) — avoids kick on setpoint change
+  float rawDeriv = -(measured - s.prevMeasured) / dt;
+  s.prevMeasured = measured;
+
+  // Low-pass filter on D term to tame gyro noise
+  s.filteredDeriv = D_LPF_ALPHA * s.filteredDeriv + (1.f - D_LPF_ALPHA) * rawDeriv;
+
+  return g.kP*err + g.kI*s.integral + g.kD*s.filteredDeriv;
 }
 
 void resetPID() {
