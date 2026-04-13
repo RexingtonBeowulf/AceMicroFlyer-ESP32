@@ -24,8 +24,8 @@
 #include <math.h>
 
 // ── Motor pins (corrected assignment) ──────────────────────
-const uint8_t MOTOR_PINS[4] = {5, 4, 2, 3};  // FL FR BL BR
-const char*   MOTOR_NAMES[4] = {"FL(GPIO5)","FR(GPIO4)","BL(GPIO2)","BR(GPIO3)"};
+const uint8_t MOTOR_PINS[4] = {4, 3, 5, 2};  // FL FR BL BR
+const char*   MOTOR_NAMES[4] = {"FL(GPIO4)","FR(GPIO3)","BL(GPIO5)","BR(GPIO2)"};
 
 const uint32_t PWM_FREQ = 20000;
 const uint8_t  PWM_RES  = 10;
