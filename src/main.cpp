@@ -385,20 +385,30 @@ void parsePacket(const std::string& s) {
 // ═══════════════════════════════════════════════════════════
 // BLE Callbacks
 // ═══════════════════════════════════════════════════════════
+// Defer gain sync so we don't block the BLE task on connect
+bool gainSyncPending = false;
+unsigned long connectMs = 0;
+
+void sendGainSync() {
+  char buf[80];
+  snprintf(buf,80,"LQR:ACK:R,%.4f,%.4f,%.4f,%.4f",
+    K_LQR[0][0],K_LQR[0][1],K_LQR[0][2],K_LQR[0][3]);
+  bleNotify(buf);
+  snprintf(buf,80,"LQR:ACK:P,%.4f,%.4f,%.4f,%.4f",
+    K_LQR[1][0],K_LQR[1][1],K_LQR[1][2],K_LQR[1][3]);
+  bleNotify(buf);
+  snprintf(buf,48,"PID:ACK:Y,%.3f,0.0000,0.000",yawKp);
+  bleNotify(buf);
+  Serial.println("[BLE] Gain sync sent");
+}
+
 class ServerCB : public BLEServerCallbacks {
   void onConnect(BLEServer*) override {
     bleConnected = true;
     Serial.println("[BLE] Connected");
-    // Sync current gains to controller app
-    char buf[80];
-    snprintf(buf,80,"LQR:ACK:R,%.4f,%.4f,%.4f,%.4f",
-      K_LQR[0][0],K_LQR[0][1],K_LQR[0][2],K_LQR[0][3]);
-    delay(200); bleNotify(buf);
-    snprintf(buf,80,"LQR:ACK:P,%.4f,%.4f,%.4f,%.4f",
-      K_LQR[1][0],K_LQR[1][1],K_LQR[1][2],K_LQR[1][3]);
-    delay(100); bleNotify(buf);
-    snprintf(buf,48,"PID:ACK:Y,%.3f,0.0000,0.000",yawKp);
-    bleNotify(buf);
+    // Don't send notifies inside onConnect — defer to main loop
+    gainSyncPending = true;
+    connectMs = millis();
   }
   void onDisconnect(BLEServer*) override {
     bleConnected = false;
@@ -484,6 +494,12 @@ unsigned long lastPrintMs = 0, lastGyroMs = 0;
 
 void loop() {
   unsigned long now = micros();
+
+  // ── Deferred gain sync (safe, outside BLE callback) ────
+  if(gainSyncPending && bleConnected && (millis() - connectMs > 1500)) {
+    gainSyncPending = false;
+    sendGainSync();
+  }
 
   // ── 500 Hz: IMU + complementary filter ─────────────────
   if(now - lastFastUs >= 2000) {
